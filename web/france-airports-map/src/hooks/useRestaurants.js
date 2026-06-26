@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
-import { useMap, useMapsLibrary } from '@vis.gl/react-google-maps';
+import { useMapsLibrary } from '@vis.gl/react-google-maps';
 import { usePlacesQueue } from './usePlacesQueue';
 import AIRPORTS from '../data/airports';
 
-const CACHE_KEY = 'rzflight_restaurants_v1';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
+const CACHE_KEY = 'rzflight_restaurants_v2';
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 function loadCache() {
   try {
@@ -27,13 +27,18 @@ function saveCache(data) {
   } catch {}
 }
 
-// status values: 'loading' | 'yes' | 'no' | 'error'
-// restaurants[icao] = { status, places: [] }
+const PRICE_LEVEL_MAP = {
+  PRICE_LEVEL_FREE: 0,
+  PRICE_LEVEL_INEXPENSIVE: 1,
+  PRICE_LEVEL_MODERATE: 2,
+  PRICE_LEVEL_EXPENSIVE: 3,
+  PRICE_LEVEL_VERY_EXPENSIVE: 4,
+};
+
 export function useRestaurants() {
-  const map = useMap();
   const placesLib = useMapsLibrary('places');
   const { enqueue } = usePlacesQueue();
-  const serviceRef = useRef(null);
+  const queued = useRef(new Set());
 
   const [results, setResults] = useState(() => {
     const cache = loadCache();
@@ -45,75 +50,60 @@ export function useRestaurants() {
     );
   });
 
-  // Track which airports already have a cached result so we skip them.
-  const pending = useRef(
-    new Set(
-      AIRPORTS.filter((a) => {
-        const c = loadCache();
-        return !c[a.icao];
-      }).map((a) => a.icao),
-    ),
-  );
-
   useEffect(() => {
-    if (!map || !placesLib) return;
+    if (!placesLib) return;
 
-    if (!serviceRef.current) {
-      serviceRef.current = new placesLib.PlacesService(map);
-    }
-    const service = serviceRef.current;
+    const cache = loadCache();
 
     AIRPORTS.forEach((airport) => {
-      if (!pending.current.has(airport.icao)) return;
+      if (cache[airport.icao] || queued.current.has(airport.icao)) return;
+      queued.current.add(airport.icao);
 
-      enqueue(
-        () =>
-          new Promise((resolve) => {
-            service.nearbySearch(
-              {
-                location: { lat: airport.lat, lng: airport.lng },
+      enqueue(async () => {
+        try {
+          const { places } = await placesLib.Place.searchNearby({
+            fields: ['displayName', 'rating', 'userRatingCount', 'priceLevel', 'formattedAddress', 'id'],
+            locationRestriction: {
+              circle: {
+                center: { lat: airport.lat, lng: airport.lng },
                 radius: 1000,
-                type: 'restaurant',
               },
-              (places, status) => {
-                if (status !== window.google.maps.places.PlacesServiceStatus.OK &&
-                    status !== window.google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
-                  console.error(`Places API error for ${airport.icao}:`, status);
-                }
-                const ok =
-                  status === window.google.maps.places.PlacesServiceStatus.OK;
-                const entry = {
-                  status: ok && places.length > 0 ? 'yes' : 'no',
-                  places: ok
-                    ? places.slice(0, 10).map((p) => ({
-                        name: p.name,
-                        rating: p.rating ?? null,
-                        userRatingsTotal: p.user_ratings_total ?? 0,
-                        priceLevel: p.price_level ?? null,
-                        vicinity: p.vicinity ?? '',
-                        placeId: p.place_id,
-                      }))
-                    : [],
-                };
+            },
+            includedPrimaryTypes: ['restaurant'],
+            maxResultCount: 10,
+          });
 
-                setResults((prev) => {
-                  const next = { ...prev, [airport.icao]: entry };
-                  // Persist to cache every time a result comes in.
-                  const cacheData = {};
-                  for (const [k, v] of Object.entries(next)) {
-                    if (v.status !== 'loading') cacheData[k] = v;
-                  }
-                  saveCache(cacheData);
-                  return next;
-                });
+          const entry = {
+            status: places.length > 0 ? 'yes' : 'no',
+            places: places.map((p) => ({
+              name: p.displayName,
+              rating: p.rating ?? null,
+              userRatingsTotal: p.userRatingCount ?? 0,
+              priceLevel: PRICE_LEVEL_MAP[p.priceLevel] ?? null,
+              vicinity: p.formattedAddress ?? '',
+              placeId: p.id,
+            })),
+          };
 
-                resolve();
-              },
-            );
-          }),
-      );
+          setResults((prev) => {
+            const next = { ...prev, [airport.icao]: entry };
+            const cacheData = {};
+            for (const [k, v] of Object.entries(next)) {
+              if (v.status !== 'loading') cacheData[k] = v;
+            }
+            saveCache(cacheData);
+            return next;
+          });
+        } catch (err) {
+          console.error(`Places search failed for ${airport.icao}:`, err);
+          setResults((prev) => ({
+            ...prev,
+            [airport.icao]: { status: 'error', places: [] },
+          }));
+        }
+      });
     });
-  }, [map, placesLib, enqueue]);
+  }, [placesLib, enqueue]);
 
   return results;
 }

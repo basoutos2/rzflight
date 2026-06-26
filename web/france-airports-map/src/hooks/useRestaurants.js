@@ -76,6 +76,10 @@ export function useRestaurants() {
                 type: 'restaurant',
               },
               (places, status) => {
+                if (status !== window.google.maps.places.PlacesServiceStatus.OK &&
+                    status !== window.google.maps.places.PlacesServiceStatus.ZERO_RESULTS) {
+                  console.error(`Places API error for ${airport.icao}:`, status);
+                }
                 const ok =
                   status === window.google.maps.places.PlacesServiceStatus.OK;
                 const entry = {
